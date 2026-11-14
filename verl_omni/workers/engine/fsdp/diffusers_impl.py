@@ -159,6 +159,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
+            # verl's helper uses warning-only mode, which permits nondeterministic SDPA backward.
+            torch.use_deterministic_algorithms(True)
 
         # set FSDP offload params
         self._is_offload_param = self.engine_config.param_offload

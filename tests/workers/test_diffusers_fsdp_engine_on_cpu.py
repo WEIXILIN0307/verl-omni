@@ -15,12 +15,36 @@
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 from verl.workers.engine.base import EngineRegistry
 
 from verl_omni.workers.engine.fsdp import diffusers_impl
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_full_determinism_requires_deterministic_kernels(monkeypatch, enabled):
+    """Opting in must select deterministic kernels rather than only warn."""
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(diffusers_impl.DiffusersFSDPEngine, "_init_device_mesh", lambda self: None)
+    monkeypatch.setattr(
+        diffusers_impl,
+        "enable_full_determinism",
+        lambda seed: torch.use_deterministic_algorithms(True, warn_only=True),
+    )
+    config = SimpleNamespace(full_determinism=enabled, seed=42, param_offload=False, optimizer_offload=False)
+    try:
+        torch.use_deterministic_algorithms(False)
+        diffusers_impl.PPODiffusersFSDPEngine(SimpleNamespace(lora_rank=0), config, None, None)
+        assert torch.are_deterministic_algorithms_enabled() is enabled
+        assert not torch.is_deterministic_algorithms_warn_only_enabled()
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn)
 
 
 @pytest.mark.parametrize(
