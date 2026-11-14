@@ -123,6 +123,7 @@ def test_diffusion_ray_runtime_env_matches_reward_config(
     class FakeRunner:
         @staticmethod
         def options(**kwargs):
+            captured["runner_options"] = kwargs
             return FakeRunner
 
         @staticmethod
@@ -161,6 +162,71 @@ def test_diffusion_ray_runtime_env_matches_reward_config(
         assert "PYTHONHASHSEED" not in env_vars
     if overrides:
         assert env_vars.get("OMP_NUM_THREADS") == "8"
+    if entrypoint == "v1":
+        assert captured["runner_options"]["runtime_env"]["env_vars"] == env_vars
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_seed"),
+    [({}, 17), ({"full_determinism": True}, 17), ({"full_determinism": False}, None), ({"seed": 99}, 99)],
+)
+def test_named_reward_determinism_inherits_shared_rollout(overrides, expected_seed):
+    """Named overrides and shared defaults resolve consistently without changing the config."""
+    from verl_omni.workers.config.reward import reward_determinism_env
+
+    config = compose_diffusion_config()
+    config.reward.reward_model.enable = False
+    config.reward.reward_model.rollout.full_determinism = True
+    config.reward.reward_model.rollout.seed = 17
+    OmegaConf.update(config, "reward.models.ocr", {"backend": "engine", "rollout": overrides}, force_add=True)
+    original = OmegaConf.to_container(config)
+    expected = (
+        {"VERL_FULL_DETERMINISM": "1", "VLLM_BATCH_INVARIANT": "1", "PYTHONHASHSEED": str(expected_seed)}
+        if expected_seed is not None
+        else {}
+    )
+    assert reward_determinism_env(config) == expected
+    assert OmegaConf.to_container(config) == original
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_v1_runner_combines_nsight_and_environment(monkeypatch, initialized):
+    """Default runner options apply once and retain both profiling and startup settings."""
+    from types import SimpleNamespace
+
+    import verl.utils.import_utils
+
+    from verl_omni.trainer import main_diffusion_v1 as entrypoint
+
+    config = compose_diffusion_config()
+    config.reward.reward_model.enable = True
+    config.reward.reward_model.rollout.full_determinism = True
+    config.reward.reward_model.rollout.seed = 17
+    config.global_profiler.tool = "nsys"
+    config.global_profiler.steps = [1]
+    for key in ("VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "PYTHONHASHSEED"):
+        monkeypatch.delenv(key, raising=False)
+    captured = {}
+
+    class Runner:
+        @staticmethod
+        def options(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(remote=lambda: Runner())
+
+        run = SimpleNamespace(remote=lambda config: None)
+
+    monkeypatch.setattr(entrypoint, "DiffusionTaskRunnerV1", Runner)
+    monkeypatch.setattr(entrypoint, "is_cuda_available", True)
+    monkeypatch.setattr(verl.utils.import_utils, "is_nvtx_available", lambda: True)
+    monkeypatch.setattr(entrypoint.ray, "is_initialized", lambda: initialized)
+    monkeypatch.setattr(entrypoint.ray, "init", lambda **kwargs: None)
+    monkeypatch.setattr(entrypoint.ray, "get", lambda value: value)
+    entrypoint.run_diffusion_v1(config)
+    assert captured["num_cpus"] == 1
+    assert captured["runtime_env"]["nsight"]
+    assert captured["runtime_env"]["env_vars"]["PYTHONHASHSEED"] == "17"
+    assert captured["runtime_env"]["env_vars"]["TRANSFER_QUEUE_ENABLE"] == "1"
 
 
 @pytest.mark.parametrize("seed", [17, 2**32, 2**63 - 1])

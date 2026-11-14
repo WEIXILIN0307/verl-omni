@@ -15,6 +15,7 @@
 
 import asyncio
 import json
+import os
 import uuid
 from types import SimpleNamespace
 
@@ -39,7 +40,14 @@ def initialized_tq():
     """Own a bounded GPU-free Ray cluster and close its queue after the module."""
     owns_ray = not ray.is_initialized()
     if owns_ray:
-        ray.init(address="local", num_gpus=0, num_cpus=4, object_store_memory=128 * 1024**2, include_dashboard=False)
+        ray.init(
+            address="local",
+            num_gpus=0,
+            num_cpus=4,
+            object_store_memory=128 * 1024**2,
+            include_dashboard=False,
+            runtime_env={"env_vars": {"PYTHONHASHSEED": "0"}},
+        )
     tq.init(OmegaConf.create({"backend": {"SimpleStorage": {"num_data_storage_units": 2}}}))
     try:
         yield
@@ -47,6 +55,42 @@ def initialized_tq():
         tq.close()
         if owns_ray:
             ray.shutdown()
+
+
+def test_preinitialized_ray_forwards_reward_environment(initialized_tq, tmp_path, monkeypatch):
+    """An existing Ray job passes startup settings to the runner and its child tasks."""
+    from verl_omni.trainer.main_diffusion_v1 import run_diffusion_v1
+
+    keys = ("VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "PYTHONHASHSEED", "TRANSFER_QUEUE_ENABLE")
+    for key in keys:
+        monkeypatch.setenv(key, "0")
+
+    @ray.remote(num_cpus=0)
+    class EnvironmentRunner:
+        def run(self, config):
+            @ray.remote(num_cpus=0)
+            def environment():
+                return {key: os.environ.get(key) for key in (*keys, "OMP_NUM_THREADS")}
+
+            result = {
+                "runner": {key: os.environ.get(key) for key in (*keys, "OMP_NUM_THREADS")},
+                "child": ray.get(environment.remote()),
+            }
+            (tmp_path / "environment.json").write_text(json.dumps(result))
+
+    config = OmegaConf.create(
+        {
+            "trainer": {"logger": []},
+            "transfer_queue": {"enable": False},
+            "ray_kwargs": {"ray_init": {"runtime_env": {"env_vars": {"OMP_NUM_THREADS": "2"}}}},
+            "reward": {
+                "reward_model": {"enable": True, "rollout": {"full_determinism": True, "seed": 17}},
+            },
+        }
+    )
+    run_diffusion_v1(config, task_runner_class=EnvironmentRunner)
+    expected = dict(zip(keys, ("1", "1", "17", "1"), strict=True), OMP_NUM_THREADS="2")
+    assert json.loads((tmp_path / "environment.json").read_text()) == {"runner": expected, "child": expected}
 
 
 @pytest.mark.parametrize("trainer_mode", ["separate_async", "colocate_async"])
